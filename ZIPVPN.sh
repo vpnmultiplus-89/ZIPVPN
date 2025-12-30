@@ -3,6 +3,24 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 trap 'echo -e "\n[ERROR] Script berhenti di baris: $LINENO\n"; exit 1' ERR
 
+wait_for_apt_lock() {
+  local timeout="${1:-180}"
+  local waited=0
+  echo "==> Menunggu APT lock (jika ada)..."
+  while fuser /var/lib/apt/lists/lock >/dev/null 2>&1 \
+     || fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 \
+     || fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+    if [ "$waited" -ge "$timeout" ]; then
+      echo "[ERROR] APT masih terkunci setelah ${timeout}s. Coba tunggu sebentar lalu jalankan ulang."
+      exit 1
+    fi
+    sleep 3
+    waited=$((waited+3))
+  done
+  # recovery ringan kalau dpkg sempat ke-interrupt
+  dpkg --configure -a >/dev/null 2>&1 || true
+}
+
 ZIVPN_BIN="/usr/local/bin/zivpn"
 ZIVPN_DIR="/etc/zivpn"
 ZIVPN_CFG="${ZIVPN_DIR}/config.json"
@@ -18,7 +36,9 @@ SYNC_SVC="zivpn-sync.service"
 SYNC_TIMER="zivpn-sync.timer"
 
 echo "==> Update packages..."
+wait_for_apt_lock 300
 apt-get update -y
+wait_for_apt_lock 300
 apt-get upgrade -y
 
 echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections || true
@@ -578,6 +598,7 @@ DASH_TPL = r'''<!doctype html>
 <html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>{{ panel_name }}</title>
 <script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr/dist/flatpickr.min.css">
 <script src="https://cdn.jsdelivr.net/npm/flatpickr"></script>
 <script>
@@ -610,12 +631,21 @@ function copyText(t, btn){
   }
 }
 
+let _bwSmooth = { rx: null, tx: null };
+function _smooth(prev, cur, alpha=0.35){
+  cur = Number(cur||0);
+  if(prev===null || prev===undefined) return cur;
+  return (prev*(1-alpha)) + (cur*alpha);
+}
+
 async function refreshBW(){
   try{
     const r=await fetch('/api/bw'); const j=await r.json();
     document.getElementById('bw-if').textContent=j.iface;
-    document.getElementById('bw-rx').textContent=j.rx_mbps+' Mbps';
-    document.getElementById('bw-tx').textContent=j.tx_mbps+' Mbps';
+    _bwSmooth.rx = _smooth(_bwSmooth.rx, j.rx_mbps);
+    _bwSmooth.tx = _smooth(_bwSmooth.tx, j.tx_mbps);
+    document.getElementById('bw-rx').textContent=_bwSmooth.rx.toFixed(2)+' Mbps';
+    document.getElementById('bw-tx').textContent=_bwSmooth.tx.toFixed(2)+' Mbps';
     document.getElementById('bw-rxt').textContent=j.rx_total_h;
     document.getElementById('bw-txt').textContent=j.tx_total_h;
   }catch(e){}
@@ -628,8 +658,8 @@ async function refreshSYS(){
     document.getElementById('memh').textContent=j.mem_used_h+' / '+j.mem_total_h;
   }catch(e){}
 }
-setInterval(refreshBW,1500);
-setInterval(refreshSYS,1500);
+setInterval(refreshBW,1000);
+setInterval(refreshSYS,1000);
 window.addEventListener('load', ()=>{refreshBW(); refreshSYS();});
 
 function parseExpToMs(expStr){
@@ -674,41 +704,90 @@ function updateBadges(){
 setInterval(updateBadges,1000);
 window.addEventListener('load', updateBadges);
 
-// Flatpickr init + preset (disable mobile)
+// Expiry modal + OK/Apply (force flatpickr, no native Android picker)
+let fpModal = null;
+let fpDraft = "";
+
+function openDateModal(){
+  const modal=document.getElementById('dateModal');
+  const hidden=document.getElementById('expiresPicker');
+  const display=document.getElementById('expiresDisplay');
+  const wrap=document.getElementById('fpInlineWrap');
+  if(!modal||!hidden||!display||!wrap||!window.flatpickr) return;
+  modal.classList.remove('hidden');
+  if(!fpModal){
+    fpModal = flatpickr(wrap, {
+      inline:true,
+      enableTime:true,
+      time_24hr:true,
+      disableMobile:true,
+      dateFormat:"Y-m-d H:i",
+      defaultDate: hidden.value || null,
+      onChange: (sel, str)=>{ fpDraft = str; }
+    });
+  } else {
+    fpModal.setDate(hidden.value || null, true);
+  }
+  fpDraft = hidden.value || (fpModal.selectedDates[0] ? fpModal.formatDate(fpModal.selectedDates[0],"Y-m-d H:i") : "");
+}
+
+function closeDateModal(){
+  document.getElementById('dateModal')?.classList.add('hidden');
+}
+
+function applyDateModal(){
+  const hidden=document.getElementById('expiresPicker');
+  const display=document.getElementById('expiresDisplay');
+  if(!hidden||!display) return;
+  hidden.value = (fpDraft||"").trim();
+  display.value = hidden.value;
+  closeDateModal();
+}
+
 window.addEventListener('load', ()=>{
-  const el = document.getElementById('expiresPicker');
-  if(!el || !window.flatpickr) return;
+  const hidden=document.getElementById('expiresPicker');
+  const display=document.getElementById('expiresDisplay');
+  if(!hidden||!display) return;
 
-  if(el.value && el.value.includes('T')) el.value = el.value.replace('T',' ');
+  display.value = (hidden.value||"");
+  display.addEventListener('click', openDateModal);
 
-  const fp = flatpickr(el, {
-    enableTime: true,
-    time_24hr: true,
-    allowInput: true,
-    disableMobile: true,
-    dateFormat: "Y-m-d H:i",
-    altInput: true,
-    altFormat: "D, d M Y • H:i",
-    defaultDate: el.value || null,
-    onReady: (_, __, inst)=>{ inst.calendarContainer.classList.add("zivpn-theme"); }
-  });
+  function parseCur(){
+    if(hidden.value){
+      const s=hidden.value.trim();
+      const p=s.split(/[- :]/);
+      if(p.length>=5){
+        return new Date(parseInt(p[0]),parseInt(p[1])-1,parseInt(p[2]),parseInt(p[3]),parseInt(p[4]),0);
+      }
+    }
+    return new Date();
+  }
 
-  function setDate(d){ fp.setDate(d, true); }
-  function getCur(){ return fp.selectedDates[0] ? new Date(fp.selectedDates[0]) : new Date(); }
+  function setInstant(d){
+    const y=d.getFullYear();
+    const mo=String(d.getMonth()+1).padStart(2,'0');
+    const da=String(d.getDate()).padStart(2,'0');
+    const hh=String(d.getHours()).padStart(2,'0');
+    const mm=String(d.getMinutes()).padStart(2,'0');
+    const val = `${y}-${mo}-${da} ${hh}:${mm}`;
+    fpDraft=val;
+    hidden.value=val;
+    display.value=val;
+    if(fpModal) fpModal.setDate(val, true);
+  }
 
-  document.querySelectorAll('[data-addmin],[data-addhr],[data-addday],[data-now],[data-eod],[data-clear]').forEach(btn=>{
+  document.querySelectorAll('[data-addday],[data-now],[data-eod],[data-clear]').forEach(btn=>{
     btn.addEventListener('click', ()=>{
-      let cur = getCur();
-      if(btn.dataset.addmin) cur.setMinutes(cur.getMinutes() + parseInt(btn.dataset.addmin,10));
-      else if(btn.dataset.addhr) cur.setHours(cur.getHours() + parseInt(btn.dataset.addhr,10));
-      else if(btn.dataset.addday) cur.setDate(cur.getDate() + parseInt(btn.dataset.addday,10));
-      else if(btn.dataset.now) cur = new Date();
-      else if(btn.dataset.eod){ cur = new Date(); cur.setHours(23,59,0,0); }
-      else if(btn.dataset.clear){ fp.clear(); el.value=""; return; }
-      setDate(cur);
+      let cur=parseCur();
+      if(btn.dataset.addday) cur.setDate(cur.getDate()+parseInt(btn.dataset.addday,10));
+      else if(btn.dataset.now) cur=new Date();
+      else if(btn.dataset.eod){ cur=new Date(); cur.setHours(23,59,0,0); }
+      else if(btn.dataset.clear){ fpDraft=""; hidden.value=""; display.value=""; if(fpModal) fpModal.clear(); return; }
+      setInstant(cur);
     });
   });
 });
+
 </script>
 
 <style>
@@ -716,6 +795,20 @@ window.addEventListener('load', ()=>{
 .btn-gradient{background:linear-gradient(90deg,#22c55e,#0ea5e9);}
 .btn-danger{background:linear-gradient(90deg,#ef4444,#f97316);}
 .text-muted{color:rgba(255,255,255,.7)}
+
+/* ===== PREMIUM COLOR CARDS + ICONS ===== */
+.card-bandwidth{
+  background: linear-gradient(135deg, rgba(99,102,241,.18), rgba(2,6,23,.55));
+  border-left: 4px solid rgba(99,102,241,.9);
+}
+.card-system{
+  background: linear-gradient(135deg, rgba(34,197,94,.18), rgba(2,6,23,.55));
+  border-left: 4px solid rgba(34,197,94,.9);
+}
+.table-row:hover{
+  background: rgba(255,255,255,.06);
+}
+
 
 /* preset buttons full color */
 .preset-green{background:linear-gradient(90deg,#22c55e,#16a34a);}
@@ -754,15 +847,34 @@ window.addEventListener('load', ()=>{
       <div>
         <h1 class="text-2xl md:text-3xl font-extrabold tracking-tight">{{ panel_name }}</h1>
         <div class="text-xs text-muted mt-1">
-          Role: <b>{{role}}</b> ({{who}}) • Server time: <span id="server-time">...</span> • VPS: {{vps_ip}}
+          Role: <b>{{role}}</b> ({{who}}) &bull; Server time: <span id="server-time">...</span> &bull; VPS: {{vps_ip}}
         </div>
       </div>
       <div class="flex gap-2">
         {% if role=="admin" %}
-          <a href="/backup" class="px-4 py-2 rounded-xl bg-white/10 border border-white/10 text-sm">Backup</a>
-          <a href="/restore" class="px-4 py-2 rounded-xl bg-white/10 border border-white/10 text-sm">Restore</a>
+          <a href="/backup"
+             class="px-4 py-2 rounded-xl text-sm font-semibold
+                    bg-gradient-to-r from-emerald-500 to-green-600
+                    hover:from-emerald-400 hover:to-green-500
+                    shadow-lg shadow-emerald-500/30 transition">
+            <i class="fa-solid fa-database mr-1"></i> Backup
+          </a>
+
+          <a href="/restore"
+             class="px-4 py-2 rounded-xl text-sm font-semibold
+                    bg-gradient-to-r from-sky-500 to-blue-600
+                    hover:from-sky-400 hover:to-blue-500
+                    shadow-lg shadow-sky-500/30 transition">
+            <i class="fa-solid fa-rotate-left mr-1"></i> Restore
+          </a>
         {% endif %}
-        <a href="/logout" class="px-4 py-2 rounded-xl bg-white/10 border border-white/10 text-sm">Logout</a>
+        <a href="/logout"
+           class="px-4 py-2 rounded-xl text-sm font-semibold
+                  bg-gradient-to-r from-red-500 to-orange-600
+                  hover:from-red-400 hover:to-orange-500
+                  shadow-lg shadow-red-500/30 transition">
+          <i class="fa-solid fa-right-from-bracket mr-1"></i> Logout
+        </a>
       </div>
     </div>
 
@@ -785,14 +897,22 @@ window.addEventListener('load', ()=>{
         <div class="text-sm text-muted">Total Online{% if role=="reseller" %} (milikmu){% endif %}</div>
         <div class="text-3xl font-extrabold mt-1">{{ total_active }}</div>
       </div>
-      <div class="glass rounded-2xl p-4">
-        <div class="text-sm text-muted">Bandwidth (<span id="bw-if">-</span>)</div>
-        <div class="mt-2 text-sm"><span class="text-muted">Download</span> <b id="bw-rx">-</b> • <span class="text-muted">Upload</span> <b id="bw-tx">-</b></div>
-        <div class="mt-1 text-xs text-muted">Total Download <span id="bw-rxt">-</span> • Total Upload <span id="bw-txt">-</span></div>
+      <div class="glass rounded-2xl p-4 card-bandwidth">
+        <div class="text-sm text-muted flex items-center gap-2"><i class="fa-solid fa-chart-line"></i><span>Bandwidth (<span id="bw-if">-</span>)</span></div>
+        <div class="mt-2 text-sm flex flex-wrap items-center gap-2">
+          <span class="text-muted flex items-center gap-1"><i class="fa-solid fa-download"></i>Download</span> <b id="bw-rx">-</b>
+          <span class="text-white/40">&bull;</span>
+          <span class="text-muted flex items-center gap-1"><i class="fa-solid fa-upload"></i>Upload</span> <b id="bw-tx">-</b>
+        </div>
+        <div class="mt-1 text-xs text-muted">Total Download <span id="bw-rxt">-</span> &bull; Total Upload <span id="bw-txt">-</span></div>
       </div>
-      <div class="glass rounded-2xl p-4">
-        <div class="text-sm text-muted">System</div>
-        <div class="mt-2 text-sm"><span class="text-muted">CPU</span> <b id="cpu">-</b> • <span class="text-muted">RAM</span> <b id="mem">-</b></div>
+      <div class="glass rounded-2xl p-4 card-system">
+        <div class="text-sm text-muted flex items-center gap-2"><i class="fa-solid fa-microchip"></i><span>System</span></div>
+        <div class="mt-2 text-sm flex flex-wrap items-center gap-2">
+          <span class="text-muted flex items-center gap-1"><i class="fa-solid fa-gauge-high"></i>CPU</span> <b id="cpu">-</b>
+          <span class="text-white/40">&bull;</span>
+          <span class="text-muted flex items-center gap-1"><i class="fa-solid fa-memory"></i>RAM</span> <b id="mem">-</b>
+        </div>
         <div class="mt-1 text-xs text-muted" id="memh">-</div>
       </div>
     </div>
@@ -808,17 +928,18 @@ window.addEventListener('load', ()=>{
             class="w-full rounded-xl p-3 bg-black/30 border border-white/10 text-white outline-none">
           <input name="password" value="{{ edit_row.password if edit_row else '' }}" placeholder="Password"
             class="w-full rounded-xl p-3 bg-black/30 border border-white/10 text-white outline-none">
-          <input id="expiresPicker" type="text" name="expires" value="{{ edit_expires if edit_expires else default_exp_dt }}"
-            class="w-full rounded-xl p-3 bg-black/30 border border-white/10 text-white outline-none" autocomplete="off" placeholder="Pilih tanggal & jam">
+          <input type="hidden" id="expiresPicker" name="expires" value="{{ edit_expires if edit_expires else default_exp_dt }}">
+          <input id="expiresDisplay" type="text" readonly inputmode="none" placeholder="Pilih tanggal & jam"
+            class="w-full rounded-xl p-3 bg-black/30 border border-white/10 text-white outline-none cursor-pointer">
           <div class="grid grid-cols-4 gap-2">
-            <button type="button" data-addmin="15" class="px-3 py-2 rounded-xl text-xs font-semibold text-white preset-green">+15m</button>
-            <button type="button" data-addhr="1"  class="px-3 py-2 rounded-xl text-xs font-semibold text-white preset-blue">+1h</button>
-            <button type="button" data-addhr="6"  class="px-3 py-2 rounded-xl text-xs font-semibold text-white preset-purple">+6h</button>
-            <button type="button" data-addday="1" class="px-3 py-2 rounded-xl text-xs font-semibold text-white preset-green">+1d</button>
-            <button type="button" data-addday="7" class="px-3 py-2 rounded-xl text-xs font-semibold text-white preset-blue">+7d</button>
+            <button type="button" data-addday="1"  class="px-3 py-2 rounded-xl text-xs font-semibold text-white preset-green">1d</button>
+            <button type="button" data-addday="7"  class="px-3 py-2 rounded-xl text-xs font-semibold text-white preset-blue">7d</button>
+            <button type="button" data-addday="15" class="px-3 py-2 rounded-xl text-xs font-semibold text-white preset-purple">15d</button>
+            <button type="button" data-addday="30" class="px-3 py-2 rounded-xl text-xs font-semibold text-white preset-orange">30d</button>
             <button type="button" data-now="1"    class="px-3 py-2 rounded-xl text-xs font-semibold text-white preset-dark">Now</button>
             <button type="button" data-eod="1"    class="px-3 py-2 rounded-xl text-xs font-semibold text-white preset-purple">End Day</button>
             <button type="button" data-clear="1"  class="px-3 py-2 rounded-xl text-xs font-semibold text-white preset-orange">Clear</button>
+            <button type="button" onclick="openDateModal()" class="px-3 py-2 rounded-xl text-xs font-semibold text-white preset-blue">Calendar</button>
           </div>
           <button class="w-full btn-gradient py-3 rounded-xl text-lg font-semibold">
             {% if edit_row and role=="admin" %}Update User{% else %}Create User{% endif %}
@@ -832,12 +953,13 @@ window.addEventListener('load', ()=>{
       <section class="glass rounded-2xl p-4">
         <h3 class="font-semibold text-lg mb-3">Trial Generator</h3>
         <form method="post" action="/trial" class="space-y-3">
-          <div class="grid grid-cols-2 gap-3">
-            <input name="qty" type="number" min="1" max="500" value="5"
-              class="w-full rounded-xl p-3 bg-black/30 border border-white/10 text-white outline-none" placeholder="Jumlah akun">
-            <input name="hours" type="number" min="1" max="720" value="24"
-              class="w-full rounded-xl p-3 bg-black/30 border border-white/10 text-white outline-none" placeholder="Jam">
-          </div>
+          <input type="hidden" name="qty" value="1">
+          <select name="minutes" class="w-full rounded-xl p-3 bg-black/30 border border-white/10 text-white outline-none">
+            <option value="10">10 Menit</option>
+            <option value="15" selected>15 Menit</option>
+            <option value="20">20 Menit</option>
+            <option value="30">30 Menit</option>
+          </select>
           <button class="w-full btn-gradient py-3 rounded-xl text-lg font-semibold">Create Trial</button>
           <div class="text-[11px] text-muted">
             {% if role=="reseller" %}Trial tercatat sebagai <b>milik reseller</b>.{% endif %}
@@ -882,7 +1004,7 @@ window.addEventListener('load', ()=>{
           </thead>
           <tbody>
             {% for u in all_users %}
-            <tr class="border-b border-white/5" data-exp="{{u.expires}}">
+            <tr class="border-b border-white/5 table-row" data-exp="{{u.expires}}">
               <td class="py-2 pr-3 font-semibold">{{u.username}}</td>
               <td class="py-2 pr-3">
                 <div class="flex items-center gap-2">
@@ -912,6 +1034,26 @@ window.addEventListener('load', ()=>{
       </div>
     </section>
   </div>
+<!-- Date Modal -->
+<div id="dateModal" class="fixed inset-0 z-[9999] hidden">
+  <div class="absolute inset-0 bg-black/60 backdrop-blur-sm" onclick="closeDateModal()"></div>
+  <div class="absolute left-1/2 top-1/2 w-[92%] max-w-[420px] -translate-x-1/2 -translate-y-1/2">
+    <div class="glass rounded-2xl border border-white/10 overflow-hidden">
+      <div class="px-4 py-3 flex items-center justify-between bg-white/5 border-b border-white/10">
+        <div class="font-semibold">Set Expiry</div>
+        <button type="button" onclick="closeDateModal()" class="px-3 py-1 rounded-lg bg-white/10 border border-white/10 text-sm">âœ•</button>
+      </div>
+      <div class="p-3">
+        <div id="fpInlineWrap" class="rounded-2xl overflow-hidden"></div>
+        <div class="mt-3 grid grid-cols-2 gap-2">
+          <button type="button" onclick="closeDateModal()" class="px-4 py-2.5 rounded-xl bg-white/10 border border-white/10 font-semibold">Cancel</button>
+          <button type="button" onclick="applyDateModal()" class="px-4 py-2.5 rounded-xl btn-gradient font-semibold">OK / Apply</button>
+        </div>
+        <div class="mt-2 text-[11px] text-white/60">Pilih tanggal &amp; jam, lalu tekan <b>OK / Apply</b>.</div>
+      </div>
+    </div>
+  </div>
+</div>
 </body></html>'''
 
 @app.route("/")
@@ -1014,25 +1156,24 @@ def save():
 @app.route("/trial", methods=["POST"])
 @login_required
 def trial():
-    qty = int(request.form.get("qty") or 1)
-    hours = int(request.form.get("hours") or 24)
-    qty = max(1, min(qty, 500))
-    hours = max(1, min(hours, 720))
+    # Trial hanya 1 akun, durasi hanya 10/15/20/30 menit
+    minutes = int(request.form.get("minutes") or 15)
+    if minutes not in (10, 15, 20, 30):
+        minutes = 15
 
     role = session.get("role", "")
     who = session.get("user", "")
     owner = who if role == "reseller" else "admin"
 
-    exp = (datetime.utcnow() + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+    exp = (datetime.utcnow() + timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
 
     with db() as con:
-        for _ in range(qty):
-            uname = "trial" + secrets.token_hex(3)
-            pw = secrets.token_hex(4)
-            con.execute("INSERT INTO users(username,password,expires,owner) VALUES(?,?,?,?)", (uname, pw, exp, owner))
+        uname = "trial" + secrets.token_hex(3)
+        pw = secrets.token_hex(4)
+        con.execute("INSERT INTO users(username,password,expires,owner) VALUES(?,?,?,?)", (uname, pw, exp, owner))
 
     sync(restart=True)
-    flash(f"Trial created: {qty} akun | {hours} jam | Exp: {exp}")
+    flash(f"Trial dibuat: 1 akun | {minutes} menit | Exp: {exp}")
     return redirect("/")
 
 @app.route("/del/<path:username>", methods=["POST"])
