@@ -1,12 +1,5 @@
 #!/bin/bash
-# MULTI PLUS VPN - ZIVPN UDP + Web Panel (Admin + Reseller) - ONE FILE INSTALLER (FIXED)
-# Fixes included:
-# - Admin & Reseller CPU/RAM/Bandwidth UI same (colored boxes)
-# - Flatpickr: OK + Batal buttons + light calendar theme (better on mobile)
-# - Admin: Edit user (password/expiry/owner reseller) + Delete
-# - Reseller quota: max users (0=unlimited) + enforce on reseller create user
-# - Mobile responsive layout improvements
-
+# MULTI PLUS VPN - ZIVPN UDP + Web Panel (Admin + Reseller) - FULL (Ubuntu 20.04/22.04 Compatible)
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
@@ -100,7 +93,6 @@ PANEL_PORT=${PANEL_PORT:-8088}
 read -rp "Bandwidth interface (eth0/ens3) [default: auto]: " BW_IFACE
 BW_IFACE=${BW_IFACE:-}
 
-# Default WA number (you can change after install in .env)
 WA_NUMBER="6287873951705"
 
 cat > "${ENV_FILE}" <<EOF
@@ -153,6 +145,7 @@ def init_db():
             username TEXT UNIQUE,
             password TEXT,
             max_users INTEGER DEFAULT 0,
+            expires_at TEXT DEFAULT '',
             created_at TEXT
         )""")
         con.execute("""CREATE TABLE IF NOT EXISTS users(
@@ -171,10 +164,15 @@ def migrate_db():
         cols = [r[1] for r in con.execute("PRAGMA table_info(resellers)")]
         if "max_users" not in cols:
             con.execute("ALTER TABLE resellers ADD COLUMN max_users INTEGER DEFAULT 0")
+        if "expires_at" not in cols:
+            con.execute("ALTER TABLE resellers ADD COLUMN expires_at TEXT DEFAULT ''")
 migrate_db()
 
 def now_utc():
     return datetime.utcnow()
+
+def now_local_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 def _safe(s, maxlen=60):
     s = (s or "").strip()
@@ -190,11 +188,24 @@ def vps_ip():
     ip=_shell(["hostname","-I"]).split()
     return ip[0] if ip else request.host.split(":")[0]
 
-def server_time_str():
+def _parse_dt(s):
+    s=(s or "").strip()
+    if not s:
+        return None
     try:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
     except Exception:
-        return "-"
+        pass
+    try:
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
+
+def _reseller_active(expires_at_text):
+    dt=_parse_dt(expires_at_text)
+    if dt is None:
+        return True  # kosong = unlimited
+    return dt > datetime.utcnow()
 
 def sync_config():
     with db() as con:
@@ -215,13 +226,10 @@ def sync_config():
     os.replace(tmp, ZIVPN_CFG)
     subprocess.Popen(["systemctl","restart",ZIVPN_SVC], stdout=DEVNULL, stderr=DEVNULL)
 
-def purge_expired():
+def purge_expired_users():
     with db() as con:
         con.execute("DELETE FROM users WHERE expires_at <= ?", (now_utc().isoformat(),))
     sync_config()
-
-def get_role():
-    return session.get("role")
 
 def login_required(role=None):
     def deco(fn):
@@ -235,11 +243,8 @@ def login_required(role=None):
         return w
     return deco
 
-def reseller_required(fn):
-    return login_required("reseller")(fn)
-
-def admin_required(fn):
-    return login_required("admin")(fn)
+def admin_required(fn): return login_required("admin")(fn)
+def reseller_required(fn): return login_required("reseller")(fn)
 
 def logs():
     return _shell(["journalctl","-u",ZIVPN_SVC,"--since","-20min","-o","cat"]).lower()
@@ -253,9 +258,9 @@ def fmt_left(td):
     d=s//86400; s%=86400
     h=s//3600; s%=3600
     m=s//60; s%=60
-    if d>0: return f"{d}d {h}h"
-    if h>0: return f"{h}h {m}m"
-    return f"{m}m {s}s"
+    if d>0: return "%dd %dh"%(d,h)
+    if h>0: return "%dh %dm"%(h,m)
+    return "%dm %ds"%(m,s)
 
 def user_rows_for_admin():
     log=logs()
@@ -284,7 +289,7 @@ def user_rows_for_admin():
             })
     return out
 
-def user_rows_for_reseller(reseller_id:int):
+def user_rows_for_reseller(reseller_id):
     log=logs()
     out=[]
     with db() as con:
@@ -315,10 +320,19 @@ def reseller_list():
             used = con.execute("SELECT COUNT(*) FROM users WHERE reseller_id=?", (rid,)).fetchone()[0]
             mx = int(r["max_users"] or 0)
             left = "-" if mx == 0 else str(max(0, mx - used))
-            out.append(dict(r) | {"used": used, "left_quota": left})
+            exp=(r["expires_at"] or "").strip()
+            active=_reseller_active(exp)
+            left_time="-"
+            if exp:
+                dt=_parse_dt(exp)
+                if dt:
+                    left_time=fmt_left(dt - datetime.utcnow())
+            base=dict(r)
+            extra={"used": used, "left_quota": left, "active": active, "left_time": left_time}
+            out.append({**base, **extra})
     return out
 
-# ------------------ Bandwidth realtime ------------------
+# ---------- Bandwidth realtime ----------
 def _default_iface():
     out=_shell(["ip","-4","route","ls"])
     for line in out.splitlines():
@@ -345,9 +359,9 @@ def _read_proc_net_dev():
         return {}
     return data
 
-def _human_gb(n:int)->str:
+def _human_gb(n):
     n=float(max(0,n))
-    return f"{(n/(1024**3)):.2f} GB"
+    return "%.2f GB"%(n/(1024**3))
 
 def get_bw_snapshot():
     iface = BW_IFACE or _default_iface()
@@ -381,7 +395,7 @@ def get_bw_snapshot():
 def api_bw():
     return jsonify(get_bw_snapshot())
 
-# ------------------ System stats ------------------
+# ---------- System stats ----------
 def get_mem_cpu():
     mem=_shell(["bash","-lc","free -m | awk '/Mem:/ {print $3\" \"$2}'"])
     used_mb,total_mb=(0,0)
@@ -408,7 +422,7 @@ def get_mem_cpu():
 def api_sys():
     return jsonify(get_mem_cpu())
 
-# ------------------ Backup & Restore ------------------
+# ---------- Backup & Restore ----------
 @app.route("/backup")
 @admin_required
 def backup():
@@ -419,7 +433,7 @@ def backup():
         try: z.write(ZIVPN_CFG, arcname="config.json")
         except Exception: pass
     mem.seek(0)
-    fn=f"zivpn-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.zip"
+    fn="zivpn-backup-%s.zip"%(datetime.now().strftime("%Y%m%d-%H%M%S"))
     return send_file(mem, as_attachment=True, download_name=fn, mimetype="application/zip")
 
 @app.route("/restore", methods=["POST"])
@@ -439,17 +453,16 @@ def restore():
                 z.extract("config.json", "/tmp")
                 os.replace("/tmp/config.json", ZIVPN_CFG)
     except Exception as e:
-        flash(f"Restore gagal: {e}")
+        flash("Restore gagal: %s"%e)
         return redirect(url_for("dash"))
     subprocess.Popen(["systemctl","restart",ZIVPN_SVC], stdout=DEVNULL, stderr=DEVNULL)
     flash("Restore sukses. Service direstart.")
     return redirect(url_for("dash"))
 
-# ------------------ Auth templates ------------------
+# ---------- Templates ----------
 LOGIN_TPL = r'''<!doctype html>
 <html><head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>{{panel_name}} - Login</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
@@ -471,29 +484,24 @@ transform: rotate(12deg); pointer-events:none;}
 <div class="w-[360px] max-w-[92vw] glass rounded-3xl p-6">
   <div class="text-xl font-extrabold">ADMIN LOGIN</div>
   <div class="text-sm muted">{{panel_name}}</div>
-
   {% with msgs = get_flashed_messages() %}
   {% if msgs %}
     <div class="mt-3 text-sm text-rose-200 bg-rose-500/10 border border-rose-500/20 rounded-xl p-2">{{ msgs[0] }}</div>
   {% endif %}
   {% endwith %}
-
   <form method="post" action="/login" class="mt-4 space-y-3">
     <input name="u" placeholder="Admin username" class="w-full rounded-2xl p-3 bg-white/10 border border-white/10 outline-none placeholder:text-white/40">
     <input name="p" type="password" placeholder="Admin password" class="w-full rounded-2xl p-3 bg-white/10 border border-white/10 outline-none placeholder:text-white/40">
     <button class="w-full btn-gloss rounded-2xl py-3 font-semibold bg-gradient-to-r from-emerald-500 via-emerald-600 to-teal-500 hover:brightness-110">Login Admin</button>
   </form>
-
   <div class="mt-4 text-center text-sm muted">
     <a href="/reseller/login" class="hover:text-white">Login Reseller</a>
   </div>
-</div>
-</body></html>'''
+</div></body></html>'''
 
 RESELLER_LOGIN_TPL = r'''<!doctype html>
 <html><head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>{{panel_name}} - Reseller Login</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
@@ -515,58 +523,22 @@ transform: rotate(12deg); pointer-events:none;}
 <div class="w-[360px] max-w-[92vw] glass rounded-3xl p-6">
   <div class="text-xl font-extrabold">RESELLER LOGIN</div>
   <div class="text-sm muted">{{panel_name}}</div>
-
   {% with msgs = get_flashed_messages() %}
   {% if msgs %}
     <div class="mt-3 text-sm text-rose-200 bg-rose-500/10 border border-rose-500/20 rounded-xl p-2">{{ msgs[0] }}</div>
   {% endif %}
   {% endwith %}
-
   <form method="post" action="/reseller/login" class="mt-4 space-y-3">
     <input name="u" placeholder="Reseller username" class="w-full rounded-2xl p-3 bg-white/10 border border-white/10 outline-none placeholder:text-white/40">
     <input name="p" type="password" placeholder="Reseller password" class="w-full rounded-2xl p-3 bg-white/10 border border-white/10 outline-none placeholder:text-white/40">
     <button class="w-full btn-gloss rounded-2xl py-3 font-semibold bg-gradient-to-r from-sky-500 via-blue-600 to-indigo-500 hover:brightness-110">Login Reseller</button>
   </form>
-
   <div class="mt-4 text-center text-sm muted space-y-1">
     <a href="/login" class="hover:text-white block">Login Admin</a>
     <div class="text-xs">Daftar reseller WA: <span class="text-white font-semibold">{{wa}}</span></div>
   </div>
-</div>
-</body></html>'''
+</div></body></html>'''
 
-@app.route("/login", methods=["GET","POST"])
-def login():
-    if request.method=="POST":
-        if request.form.get("u")==ADMIN_USER and request.form.get("p")==ADMIN_PASS:
-            session["ok"]=True
-            session["role"]="admin"
-            session["rid"]=None
-            return redirect(url_for("dash"))
-        flash("Invalid admin credentials")
-    return render_template_string(LOGIN_TPL, panel_name=PANEL_NAME)
-
-@app.route("/reseller/login", methods=["GET","POST"])
-def reseller_login():
-    if request.method=="POST":
-        u=_safe(request.form.get("u"))
-        p=_safe(request.form.get("p"))
-        with db() as con:
-            r=con.execute("SELECT * FROM resellers WHERE username=? AND password=?", (u,p)).fetchone()
-        if r:
-            session["ok"]=True
-            session["role"]="reseller"
-            session["rid"]=int(r["id"])
-            return redirect(url_for("reseller_dash"))
-        flash("Invalid reseller credentials")
-    return render_template_string(RESELLER_LOGIN_TPL, panel_name=PANEL_NAME, wa=WA_NUMBER)
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
-# ------------------ Shared UI + Flatpickr OK/Batal (Light Theme) ------------------
 COMMON_STYLE = r'''
 <style>
 :root{color-scheme:dark}
@@ -585,6 +557,14 @@ transform: rotate(12deg); pointer-events:none;}
 .muted{color: rgba(226,232,240,.70)}
 .tiny{font-size:12px}
 .chip{font-family: ui-monospace, SFMono-Regular, Menlo, monospace;}
+
+.qbtn{border:1px solid rgba(255,255,255,.12); color:#fff}
+.q1d{background: linear-gradient(90deg, rgba(16,185,129,.85), rgba(5,150,105,.85));}
+.q7d{background: linear-gradient(90deg, rgba(59,130,246,.85), rgba(37,99,235,.85));}
+.q15d{background: linear-gradient(90deg, rgba(168,85,247,.85), rgba(126,34,206,.85));}
+.q30d{background: linear-gradient(90deg, rgba(245,158,11,.85), rgba(217,119,6,.85));}
+.qnow{background: linear-gradient(90deg, rgba(244,63,94,.80), rgba(236,72,153,.80));}
+.qclr{background: linear-gradient(90deg, rgba(100,116,139,.75), rgba(30,41,59,.75));}
 
 /* Flatpickr LIGHT THEME */
 .flatpickr-calendar{
@@ -627,6 +607,7 @@ function fallbackCopy(text, cb){
   try{ document.execCommand('copy'); }catch(e){}
   document.body.removeChild(ta); cb && cb();
 }
+
 async function refreshBW(){
   try{
     const r=await fetch('/api/bw',{cache:'no-store'});
@@ -650,16 +631,13 @@ async function refreshSYS(){
   }catch(e){}
 }
 
-function initExpiryPicker(){
-  const input=document.getElementById('expires_at');
+function initPicker(inputId){
+  const input=document.getElementById(inputId);
   if(!input) return;
-
   let prevVal="";
   function addCancel(fp){
-    // plugin adds button with class flatpickr-confirm
     const okBtn = fp.calendarContainer.querySelector(".flatpickr-confirm");
     if(!okBtn) return;
-
     const cancel=document.createElement("button");
     cancel.type="button";
     cancel.className="flatpickr-confirm";
@@ -671,8 +649,7 @@ function initExpiryPicker(){
     });
     okBtn.parentNode.appendChild(cancel);
   }
-
-  flatpickr("#expires_at", {
+  flatpickr("#"+inputId, {
     disableMobile:true,
     enableTime:true,
     enableSeconds:true,
@@ -691,7 +668,8 @@ window.addEventListener('load', ()=>{
   setInterval(refreshBW, 1000);
   setInterval(refreshSYS, 2000);
 
-  initExpiryPicker();
+  initPicker("expires_at");
+  initPicker("reseller_expires_at");
 
   const setExp=(mins)=>{
     const el=document.getElementById('expires_at');
@@ -700,10 +678,7 @@ window.addEventListener('load', ()=>{
     const s=d.getFullYear()+"-"+fmt2(d.getMonth()+1)+"-"+fmt2(d.getDate())+" "+fmt2(d.getHours())+":"+fmt2(d.getMinutes())+":"+fmt2(d.getSeconds());
     el.value=s;
   }
-  const bind=(id, fn)=>{
-    const b=document.getElementById(id);
-    if(b) b.onclick=fn;
-  }
+  const bind=(id, fn)=>{ const b=document.getElementById(id); if(b) b.onclick=fn; }
   bind('b1d', ()=>setExp(1440));
   bind('b7d', ()=>setExp(10080));
   bind('b15d', ()=>setExp(21600));
@@ -743,11 +718,9 @@ COLORED_BOXES = r'''
 </section>
 '''
 
-# ------------------ ADMIN DASHBOARD ------------------
 DASH_TPL = r'''<!doctype html>
 <html><head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>{{panel_name}} - Admin</title>
 <script src="https://cdn.tailwindcss.com"></script>
 
@@ -792,17 +765,6 @@ DASH_TPL = r'''<!doctype html>
   {% endif %}
   {% endwith %}
 
-  <section class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-    <div class="glass rounded-3xl p-4">
-      <div class="muted text-sm">Total Users</div>
-      <div class="text-4xl font-extrabold mt-1">{{total_users}}</div>
-    </div>
-    <div class="glass rounded-3xl p-4">
-      <div class="muted text-sm">Total Online</div>
-      <div class="text-4xl font-extrabold mt-1 text-emerald-300">{{total_online}}</div>
-    </div>
-  </section>
-
   ''' + COLORED_BOXES + r'''
 
   <section class="glass rounded-3xl p-4">
@@ -812,14 +774,14 @@ DASH_TPL = r'''<!doctype html>
       <input name="password" placeholder="Password" class="w-full rounded-2xl p-3 bg-white/10 border border-white/10 outline-none placeholder:text-white/40">
 
       <div class="grid grid-cols-2 gap-2">
-        <button type="button" id="b1d" class="soft rounded-2xl py-2 text-sm btn-gloss">1d</button>
-        <button type="button" id="b7d" class="soft rounded-2xl py-2 text-sm btn-gloss">7d</button>
-        <button type="button" id="b15d" class="soft rounded-2xl py-2 text-sm btn-gloss">15d</button>
-        <button type="button" id="b30d" class="soft rounded-2xl py-2 text-sm btn-gloss">30d</button>
+        <button type="button" id="b1d" class="btn-gloss qbtn q1d rounded-2xl py-2 text-sm">1d</button>
+        <button type="button" id="b7d" class="btn-gloss qbtn q7d rounded-2xl py-2 text-sm">7d</button>
+        <button type="button" id="b15d" class="btn-gloss qbtn q15d rounded-2xl py-2 text-sm">15d</button>
+        <button type="button" id="b30d" class="btn-gloss qbtn q30d rounded-2xl py-2 text-sm">30d</button>
       </div>
       <div class="grid grid-cols-2 gap-2">
-        <button type="button" id="bnow" class="soft rounded-2xl py-2 text-sm btn-gloss">Now</button>
-        <button type="button" id="bclear" class="soft rounded-2xl py-2 text-sm btn-gloss">Clear</button>
+        <button type="button" id="bnow" class="btn-gloss qbtn qnow rounded-2xl py-2 text-sm">Now</button>
+        <button type="button" id="bclear" class="btn-gloss qbtn qclr rounded-2xl py-2 text-sm">Clear</button>
       </div>
 
       <input id="expires_at" name="expires_at" value="{{default_exp}}" placeholder="YYYY-MM-DD HH:MM:SS"
@@ -843,6 +805,8 @@ DASH_TPL = r'''<!doctype html>
       <input name="username" placeholder="Username reseller" class="w-full rounded-2xl p-3 bg-white/10 border border-white/10 outline-none placeholder:text-white/40">
       <input name="password" placeholder="Password reseller (kosong = auto)" class="w-full rounded-2xl p-3 bg-white/10 border border-white/10 outline-none placeholder:text-white/40">
       <input name="max_users" placeholder="Max users reseller (0 = unlimited)" class="w-full rounded-2xl p-3 bg-white/10 border border-white/10 outline-none placeholder:text-white/40">
+      <input id="reseller_expires_at" name="expires_at" placeholder="Expired reseller (kosong = unlimited) YYYY-MM-DD HH:MM:SS"
+        class="w-full rounded-2xl p-3 bg-white/10 border border-white/10 outline-none placeholder:text-white/40">
       <button class="w-full btn-gloss rounded-2xl py-3 font-semibold bg-gradient-to-r from-sky-500 via-blue-600 to-indigo-500 hover:brightness-110">Buat Reseller</button>
       <div class="tiny muted">Daftar reseller WA: <b class="text-white">{{wa}}</b></div>
     </form>
@@ -855,7 +819,7 @@ DASH_TPL = r'''<!doctype html>
         <div class="space-y-2">
           {% for rr in resellers %}
             <div class="soft rounded-xl p-3">
-              <div class="flex items-center justify-between gap-2">
+              <div class="flex items-start justify-between gap-2">
                 <div class="min-w-0">
                   <div class="font-semibold truncate">{{rr['username']}}</div>
                   <div class="tiny muted">Created: {{rr['created_at']}}</div>
@@ -864,18 +828,38 @@ DASH_TPL = r'''<!doctype html>
                     • Used: <b class="text-white">{{ rr['used'] }}</b>
                     • Left: <b class="text-white">{{ rr['left_quota'] }}</b>
                   </div>
+                  <div class="tiny muted">
+                    Expired: <b class="text-white">{{ rr['expires_at'] if rr['expires_at'] else 'unlimited' }}</b>
+                    • Left: <b class="text-white">{{ rr['left_time'] }}</b>
+                  </div>
                 </div>
-                <div class="flex items-center gap-2">
-                  <code class="chip px-2 py-1 rounded-lg bg-white/10 border border-white/10">{{rr['password']}}</code>
-                  <button type="button" onclick="copyText('{{rr['password']}}', this)" class="btn-gloss soft rounded-xl px-3 py-2 text-sm">Copy</button>
+                <div class="flex flex-col gap-2 items-end">
+                  {% if rr['active'] %}
+                    <span class="text-emerald-300 tiny px-3 py-1 rounded-full soft">ACTIVE</span>
+                  {% else %}
+                    <span class="text-rose-300 tiny px-3 py-1 rounded-full soft">EXPIRED</span>
+                  {% endif %}
+                  <div class="flex items-center gap-2">
+                    <code class="chip px-2 py-1 rounded-lg bg-white/10 border border-white/10">{{rr['password']}}</code>
+                    <button type="button" onclick="copyText('{{rr['password']}}', this)" class="btn-gloss soft rounded-xl px-3 py-2 text-sm">Copy</button>
+                  </div>
+                  <button type="button" class="btn-gloss soft rounded-xl px-3 py-2 text-sm"
+                    onclick="document.getElementById('edit-rs-{{rr['id']}}').classList.toggle('hidden')">Edit</button>
                 </div>
               </div>
 
-              <form method="post" action="/admin/reseller/quota/{{rr['id']}}" class="flex items-center gap-2 mt-2">
-                <input name="max_users" inputmode="numeric" placeholder="Set quota"
-                  class="w-28 rounded-xl p-2 bg-white/10 border border-white/10 outline-none tiny">
-                <button class="btn-gloss soft rounded-xl px-3 py-2 text-sm">Set</button>
-              </form>
+              <div id="edit-rs-{{rr['id']}}" class="hidden mt-3 soft rounded-2xl p-3">
+                <form method="post" action="/admin/reseller/update/{{rr['id']}}" class="space-y-2">
+                  <input name="password" value="{{rr['password']}}" placeholder="Password reseller"
+                    class="w-full rounded-2xl p-3 bg-white/10 border border-white/10 outline-none placeholder:text-white/40">
+                  <input name="max_users" value="{{rr['max_users']}}" placeholder="Max users reseller (0=unlimited)"
+                    class="w-full rounded-2xl p-3 bg-white/10 border border-white/10 outline-none placeholder:text-white/40">
+                  <input name="expires_at" value="{{rr['expires_at']}}" placeholder="Expired reseller (kosong = unlimited) YYYY-MM-DD HH:MM:SS"
+                    class="w-full rounded-2xl p-3 bg-white/10 border border-white/10 outline-none placeholder:text-white/40">
+                  <button class="w-full btn-gloss rounded-2xl py-3 font-semibold bg-gradient-to-r from-emerald-500 to-teal-500 hover:brightness-110">Save Reseller</button>
+                </form>
+              </div>
+
             </div>
           {% endfor %}
         </div>
@@ -947,11 +931,9 @@ DASH_TPL = r'''<!doctype html>
 </main>
 </body></html>'''
 
-# ------------------ RESELLER DASHBOARD ------------------
 RESELLER_DASH_TPL = r'''<!doctype html>
 <html><head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>{{panel_name}} - Reseller</title>
 <script src="https://cdn.tailwindcss.com"></script>
 
@@ -991,14 +973,14 @@ RESELLER_DASH_TPL = r'''<!doctype html>
       <input name="password" placeholder="Password" class="w-full rounded-2xl p-3 bg-white/10 border border-white/10 outline-none placeholder:text-white/40">
 
       <div class="grid grid-cols-2 gap-2">
-        <button type="button" id="b1d" class="soft rounded-2xl py-2 text-sm btn-gloss">1d</button>
-        <button type="button" id="b7d" class="soft rounded-2xl py-2 text-sm btn-gloss">7d</button>
-        <button type="button" id="b15d" class="soft rounded-2xl py-2 text-sm btn-gloss">15d</button>
-        <button type="button" id="b30d" class="soft rounded-2xl py-2 text-sm btn-gloss">30d</button>
+        <button type="button" id="b1d" class="btn-gloss qbtn q1d rounded-2xl py-2 text-sm">1d</button>
+        <button type="button" id="b7d" class="btn-gloss qbtn q7d rounded-2xl py-2 text-sm">7d</button>
+        <button type="button" id="b15d" class="btn-gloss qbtn q15d rounded-2xl py-2 text-sm">15d</button>
+        <button type="button" id="b30d" class="btn-gloss qbtn q30d rounded-2xl py-2 text-sm">30d</button>
       </div>
       <div class="grid grid-cols-2 gap-2">
-        <button type="button" id="bnow" class="soft rounded-2xl py-2 text-sm btn-gloss">Now</button>
-        <button type="button" id="bclear" class="soft rounded-2xl py-2 text-sm btn-gloss">Clear</button>
+        <button type="button" id="bnow" class="btn-gloss qbtn qnow rounded-2xl py-2 text-sm">Now</button>
+        <button type="button" id="bclear" class="btn-gloss qbtn qclr rounded-2xl py-2 text-sm">Clear</button>
       </div>
 
       <input id="expires_at" name="expires_at" value="{{default_exp}}" placeholder="YYYY-MM-DD HH:MM:SS"
@@ -1042,25 +1024,57 @@ RESELLER_DASH_TPL = r'''<!doctype html>
 </main>
 </body></html>'''
 
-# ------------------ Routes ------------------
+# ---------- Auth Routes ----------
+@app.route("/login", methods=["GET","POST"])
+def login():
+    if request.method=="POST":
+        if request.form.get("u")==ADMIN_USER and request.form.get("p")==ADMIN_PASS:
+            session["ok"]=True
+            session["role"]="admin"
+            session["rid"]=None
+            return redirect(url_for("dash"))
+        flash("Invalid admin credentials")
+    return render_template_string(LOGIN_TPL, panel_name=PANEL_NAME)
+
+@app.route("/reseller/login", methods=["GET","POST"])
+def reseller_login():
+    if request.method=="POST":
+        u=_safe(request.form.get("u"))
+        p=_safe(request.form.get("p"))
+        with db() as con:
+            r=con.execute("SELECT * FROM resellers WHERE username=? AND password=?", (u,p)).fetchone()
+        if r:
+            exp=(r["expires_at"] or "").strip()
+            if exp and not _reseller_active(exp):
+                flash("Reseller expired. Hubungi admin.")
+                return redirect(url_for("reseller_login"))
+            session["ok"]=True
+            session["role"]="reseller"
+            session["rid"]=int(r["id"])
+            return redirect(url_for("reseller_dash"))
+        flash("Invalid reseller credentials")
+    return render_template_string(RESELLER_LOGIN_TPL, panel_name=PANEL_NAME, wa=WA_NUMBER)
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+# ---------- Pages ----------
 @app.route("/")
 @login_required()
 def dash():
-    if get_role()=="reseller":
+    if session.get("role")=="reseller":
         return redirect(url_for("reseller_dash"))
     ip=vps_ip()
     rows=user_rows_for_admin()
-    total_users=len(rows)
-    total_online=sum(1 for r in rows if (not r["expired"]))
     default_exp=(datetime.now()+timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
     return render_template_string(
         DASH_TPL,
         panel_name=PANEL_NAME,
-        server_time=server_time_str(),
+        server_time=now_local_str(),
         ip=ip,
         rows=rows,
-        total_users=total_users,
-        total_online=total_online,
         default_exp=default_exp,
         resellers=reseller_list(),
         wa=WA_NUMBER
@@ -1085,7 +1099,7 @@ def reseller_dash():
         default_exp=default_exp
     )
 
-# Admin actions
+# ---------- Admin user actions ----------
 @app.route("/admin/user/create", methods=["POST"])
 @admin_required
 def admin_user_create():
@@ -1114,18 +1128,15 @@ def admin_user_create():
                        ON CONFLICT(username) DO UPDATE SET password=?, expires_at=?, reseller_id=?""",
                     (u,p,exp,rid,now_utc().isoformat(),p,exp,rid))
     sync_config()
-    ip=vps_ip()
-    owner = "Admin" if not rid else f"Reseller #{rid}"
-    flash(f"Create Account Done\nIP : {ip}\nUser : {u}\nPassword : {p}\nExpired : {exp}\nOwner : {owner}\n1 User For 1 Device")
+    flash("Create Account Done\nIP : %s\nUser : %s\nPassword : %s\nExpired : %s\n1 User For 1 Device"%(vps_ip(),u,p,exp))
     return redirect(url_for("dash"))
 
 @app.route("/admin/user/update/<int:uid>", methods=["POST"])
 @admin_required
-def admin_user_update(uid:int):
+def admin_user_update(uid):
     p=_safe(request.form.get("password"))
     exp=_safe(request.form.get("expires_at"), maxlen=32)
     reseller_id=request.form.get("reseller_id") or None
-
     if not p or not exp:
         flash("Update gagal: password & expiry wajib")
         return redirect(url_for("dash"))
@@ -1134,12 +1145,10 @@ def admin_user_update(uid:int):
     except Exception:
         flash("Format expiry salah. Pakai: YYYY-MM-DD HH:MM:SS")
         return redirect(url_for("dash"))
-
     rid=None
     if reseller_id:
         try: rid=int(reseller_id)
         except Exception: rid=None
-
     with db() as con:
         con.execute("UPDATE users SET password=?, expires_at=?, reseller_id=? WHERE id=?",
                     (p, exp, rid, uid))
@@ -1149,25 +1158,27 @@ def admin_user_update(uid:int):
 
 @app.route("/admin/user/delete/<int:uid>", methods=["POST"])
 @admin_required
-def admin_user_delete(uid:int):
+def admin_user_delete(uid):
     with db() as con:
         con.execute("DELETE FROM users WHERE id=?", (uid,))
     sync_config()
     flash("User deleted.")
     return redirect(url_for("dash"))
 
+# ---------- Admin reseller actions ----------
 @app.route("/admin/reseller/create", methods=["POST"])
 @admin_required
 def admin_reseller_create():
     u=_safe(request.form.get("username"))
     p=_safe(request.form.get("password"))
     mx_raw=_safe(request.form.get("max_users"), maxlen=12)
+    exp=_safe(request.form.get("expires_at"), maxlen=32)
 
     if not u:
         flash("Buat reseller gagal: username kosong")
         return redirect(url_for("dash"))
     if not p:
-        p = f"rs{int(time.time())%1000000}"
+        p = "rs%s"%(int(time.time())%1000000)
 
     try:
         mx=int(mx_raw) if mx_raw else 0
@@ -1175,36 +1186,59 @@ def admin_reseller_create():
     except Exception:
         mx=0
 
+    if exp:
+        try:
+            datetime.strptime(exp, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            flash("Format expiry reseller salah. Pakai: YYYY-MM-DD HH:MM:SS (atau kosong)")
+            return redirect(url_for("dash"))
+
     with db() as con:
-        con.execute("""INSERT INTO resellers(username,password,max_users,created_at)
-                       VALUES(?,?,?,?)
-                       ON CONFLICT(username) DO UPDATE SET password=?, max_users=?""",
-                    (u,p,mx,server_time_str(),p,mx))
-    flash(f"Reseller dibuat.\nUsername: {u}\nPassword: {p}\nMax Users: {mx if mx else 'unlimited'}\nDaftar reseller WA: {WA_NUMBER}")
+        con.execute("""INSERT INTO resellers(username,password,max_users,expires_at,created_at)
+                       VALUES(?,?,?,?,?)
+                       ON CONFLICT(username) DO UPDATE SET password=?, max_users=?, expires_at=?""",
+                    (u,p,mx,exp,now_local_str(),p,mx,exp))
+    flash("Reseller dibuat / diupdate.")
     return redirect(url_for("dash"))
 
-@app.route("/admin/reseller/quota/<int:rid>", methods=["POST"])
+@app.route("/admin/reseller/update/<int:rid>", methods=["POST"])
 @admin_required
-def admin_reseller_quota(rid:int):
+def admin_reseller_update(rid):
+    p=_safe(request.form.get("password"))
     mx_raw=_safe(request.form.get("max_users"), maxlen=12)
+    exp=_safe(request.form.get("expires_at"), maxlen=32)
+
+    if not p:
+        flash("Update reseller gagal: password wajib")
+        return redirect(url_for("dash"))
+
     try:
-        mx=int(mx_raw)
+        mx=int(mx_raw) if mx_raw else 0
         if mx < 0: mx=0
     except Exception:
         mx=0
+
+    if exp:
+        try:
+            datetime.strptime(exp, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            flash("Format expiry reseller salah. Pakai: YYYY-MM-DD HH:MM:SS (atau kosong)")
+            return redirect(url_for("dash"))
+
     with db() as con:
-        con.execute("UPDATE resellers SET max_users=? WHERE id=?", (mx,rid))
-    flash(f"Quota reseller #{rid} updated: {mx if mx else 'unlimited'}")
+        con.execute("UPDATE resellers SET password=?, max_users=?, expires_at=? WHERE id=?",
+                    (p,mx,exp,rid))
+    flash("Reseller updated.")
     return redirect(url_for("dash"))
 
 @app.route("/purge", methods=["POST"])
 @admin_required
 def purge():
-    purge_expired()
+    purge_expired_users()
     flash("Expired users purged + config synced.")
     return redirect(url_for("dash"))
 
-# Reseller action (enforce quota)
+# ---------- Reseller create user (quota + expiry check) ----------
 @app.route("/reseller/user/create", methods=["POST"])
 @reseller_required
 def reseller_user_create():
@@ -1213,11 +1247,16 @@ def reseller_user_create():
     with db() as con:
         rr = con.execute("SELECT * FROM resellers WHERE id=?", (rid,)).fetchone()
         if rr:
+            exp=(rr["expires_at"] or "").strip()
+            if exp and not _reseller_active(exp):
+                flash("Reseller expired. Tidak bisa create user.")
+                return redirect(url_for("reseller_dash"))
+
             mx=int(rr["max_users"] or 0)
             if mx > 0:
                 used = con.execute("SELECT COUNT(*) FROM users WHERE reseller_id=?", (rid,)).fetchone()[0]
                 if used >= mx:
-                    flash(f"Quota reseller habis. Max {mx} user.")
+                    flash("Quota reseller habis. Max %d user."%mx)
                     return redirect(url_for("reseller_dash"))
 
     u=_safe(request.form.get("username"))
@@ -1240,8 +1279,7 @@ def reseller_user_create():
                     (u,p,exp,rid,now_utc().isoformat(),p,exp,rid))
 
     sync_config()
-    ip=vps_ip()
-    flash(f"Create Account Done\nIP : {ip}\nUser : {u}\nPassword : {p}\nExpired : {exp}\n1 User For 1 Device")
+    flash("Create Account Done\nIP : %s\nUser : %s\nPassword : %s\nExpired : %s\n1 User For 1 Device"%(vps_ip(),u,p,exp))
     return redirect(url_for("reseller_dash"))
 
 if __name__=="__main__":
@@ -1249,7 +1287,7 @@ if __name__=="__main__":
     serve(app, host=os.getenv("BIND_HOST","0.0.0.0"), port=int(os.getenv("BIND_PORT","8088")))
 PY
 
-# Maintenance script (auto purge expired + sync)
+# Maintenance script (auto purge expired users + sync)
 cat > "${MAINT_PY}" <<'PY'
 import os, sqlite3, json, tempfile, subprocess
 from datetime import datetime
@@ -1265,7 +1303,8 @@ def now_iso():
 def sync():
     with sqlite3.connect(DB) as con:
         pw=[r[0] for r in con.execute("SELECT DISTINCT password FROM users WHERE expires_at > ?", (now_iso(),))]
-    if not pw: pw=["zi"]
+    if not pw:
+        pw=["zi"]
     cfg={}
     try:
         cfg=json.load(open(CFG))
@@ -1279,13 +1318,13 @@ def sync():
     os.replace(tmp, CFG)
     subprocess.Popen(["systemctl","restart",SVC], stdout=DEVNULL, stderr=DEVNULL)
 
-def purge():
+def purge_users():
     with sqlite3.connect(DB) as con:
         con.execute("DELETE FROM users WHERE expires_at <= ?", (now_iso(),))
     sync()
 
 if __name__=="__main__":
-    purge()
+    purge_users()
 PY
 
 chmod +x "${APP_PY}" "${MAINT_PY}"
@@ -1340,5 +1379,5 @@ echo "INSTALL COMPLETE"
 echo "Open Admin    : http://${IP}:${PANEL_PORT}/login"
 echo "Open Reseller : http://${IP}:${PANEL_PORT}/reseller/login"
 echo "UDP Port      : 5667 (NAT 6000-19999 -> 5667)"
-echo "Auto purge expired: every 10 minutes"
+echo "Auto purge expired users: every 10 minutes"
 echo "======================================"
